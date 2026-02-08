@@ -1,0 +1,340 @@
+name: "Sage AI Code Review"
+description: "AI-powered code reviews with your choice of LLM (Anthropic Claude, OpenAI GPT, Google Gemini)"
+author: "Sage Contributors"
+
+branding:
+  icon: "zap"
+  color: "purple"
+
+inputs:
+  github-token:
+    description: "GitHub token for API access (use secrets.GITHUB_TOKEN)"
+    required: true
+
+  # LLM Provider Configuration
+  llm-provider:
+    description: "LLM provider to use (anthropic, openai, google)"
+    required: false
+    default: "anthropic"
+
+  llm-api-key:
+    description: "API key for your chosen LLM provider"
+    required: true
+
+  llm-model:
+    description: "Model to use (provider-specific). Defaults: claude-sonnet-4-5-20250929, gpt-4-turbo-preview, gemini-1.5-pro"
+    required: false
+    default: ""
+
+  # Gemini-specific (only needed for Gemini provider)
+  google-project-id:
+    description: "Google Cloud project ID (required for Gemini provider)"
+    required: false
+    default: ""
+
+  google-location:
+    description: "Google Cloud location (for Gemini provider)"
+    required: false
+    default: "us-central1"
+
+  # Review Configuration
+  max-files:
+    description: "Maximum number of files to review (cost control)"
+    required: false
+    default: "50"
+
+  max-lines:
+    description: "Maximum total lines changed (cost control)"
+    required: false
+    default: "2000"
+
+  max-tokens:
+    description: "Maximum tokens per review (cost control)"
+    required: false
+    default: "50000"
+
+  thinking-budget:
+    description: "Token budget for extended thinking (Anthropic only, higher = deeper analysis)"
+    required: false
+    default: "10000"
+
+  guidelines-path:
+    description: "Path to SAGE.md file with project-specific guidelines"
+    required: false
+    default: "SAGE.md"
+
+  severity-threshold:
+    description: "Minimum severity to report (CRITICAL, HIGH, MEDIUM, LOW)"
+    required: false
+    default: "LOW"
+
+  fail-on-errors:
+    description: "Fail the workflow if LLM API errors (true/false)"
+    required: false
+    default: "false"
+
+outputs:
+  review-completed:
+    description: "Whether the review completed successfully (true/false)"
+    value: ${{ steps.review.outputs.completed }}
+
+  findings-count:
+    description: "Total number of findings"
+    value: ${{ steps.review.outputs.findings_count }}
+
+  critical-count:
+    description: "Number of critical findings"
+    value: ${{ steps.review.outputs.critical_count }}
+
+  high-count:
+    description: "Number of high severity findings"
+    value: ${{ steps.review.outputs.high_count }}
+
+  cost-estimate:
+    description: "Estimated cost in USD"
+    value: ${{ steps.review.outputs.cost_estimate }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate Inputs
+      shell: bash
+      run: |
+        # Validate required inputs
+        if [ -z "${{ inputs.github-token }}" ]; then
+          echo "::error::github-token is required"
+          exit 1
+        fi
+
+        if [ -z "${{ inputs.llm-api-key }}" ]; then
+          echo "::error::llm-api-key is required"
+          exit 1
+        fi
+
+        # Validate API key length (basic check without logging the key)
+        API_KEY_LEN=${#${{ inputs.llm-api-key }}}
+        if [ "$API_KEY_LEN" -lt 10 ]; then
+          echo "::error::llm-api-key is too short (minimum 10 characters)"
+          exit 1
+        fi
+
+        if [ "$API_KEY_LEN" -gt 500 ]; then
+          echo "::error::llm-api-key is too long (maximum 500 characters)"
+          exit 1
+        fi
+
+        # Validate provider (strict whitelist)
+        PROVIDER="${{ inputs.llm-provider }}"
+        if [[ ! "$PROVIDER" =~ ^(anthropic|openai|google)$ ]]; then
+          echo "::error::Invalid provider: $PROVIDER. Must be: anthropic, openai, or google"
+          exit 1
+        fi
+
+        # Gemini-specific validation
+        if [ "$PROVIDER" = "google" ] && [ -z "${{ inputs.google-project-id }}" ]; then
+          echo "::error::google-project-id is required when using Gemini provider"
+          exit 1
+        fi
+
+        # Validate numeric inputs are positive integers
+        if ! [[ "${{ inputs.max-files }}" =~ ^[0-9]+$ ]] || [ "${{ inputs.max-files }}" -lt 1 ]; then
+          echo "::error::max-files must be a positive integer (got: ${{ inputs.max-files }})"
+          exit 1
+        fi
+
+        if ! [[ "${{ inputs.max-lines }}" =~ ^[0-9]+$ ]] || [ "${{ inputs.max-lines }}" -lt 1 ]; then
+          echo "::error::max-lines must be a positive integer (got: ${{ inputs.max-lines }})"
+          exit 1
+        fi
+
+        # Validate max-tokens with bounds
+        MAX_TOKENS="${{ inputs.max-tokens }}"
+        if ! [[ "$MAX_TOKENS" =~ ^[0-9]+$ ]]; then
+          echo "::error::max-tokens must be a positive integer (got: $MAX_TOKENS)"
+          exit 1
+        fi
+
+        if [ "$MAX_TOKENS" -lt 1000 ] || [ "$MAX_TOKENS" -gt 200000 ]; then
+          echo "::error::max-tokens must be between 1000 and 200000 (got: $MAX_TOKENS)"
+          exit 1
+        fi
+
+        # Validate thinking-budget with bounds
+        THINKING_BUDGET="${{ inputs.thinking-budget }}"
+        if ! [[ "$THINKING_BUDGET" =~ ^[0-9]+$ ]]; then
+          echo "::error::thinking-budget must be a non-negative integer (got: $THINKING_BUDGET)"
+          exit 1
+        fi
+
+        if [ "$THINKING_BUDGET" -gt 100000 ]; then
+          echo "::error::thinking-budget must not exceed 100000 (got: $THINKING_BUDGET)"
+          exit 1
+        fi
+
+        # Validate severity-threshold (strict enum)
+        SEVERITY="${{ inputs.severity-threshold }}"
+        if [[ ! "$SEVERITY" =~ ^(CRITICAL|HIGH|MEDIUM|LOW)$ ]]; then
+          echo "::error::Invalid severity-threshold: $SEVERITY. Must be: CRITICAL, HIGH, MEDIUM, or LOW"
+          exit 1
+        fi
+
+        # Validate fail-on-errors is boolean
+        FAIL_ON_ERRORS="${{ inputs.fail-on-errors }}"
+        if [[ ! "$FAIL_ON_ERRORS" =~ ^(true|false)$ ]]; then
+          echo "::error::fail-on-errors must be 'true' or 'false' (got: $FAIL_ON_ERRORS)"
+          exit 1
+        fi
+
+        # Validate guidelines-path doesn't contain directory traversal
+        GUIDELINES_PATH="${{ inputs.guidelines-path }}"
+        if [[ "$GUIDELINES_PATH" == *".."* ]] || [[ "$GUIDELINES_PATH" == /* ]]; then
+          echo "::error::guidelines-path must be relative and not contain '..' (got: $GUIDELINES_PATH)"
+          exit 1
+        fi
+
+        echo "[OK] Input validation passed"
+
+    - name: Check Trigger Condition
+      id: check-trigger
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        EVENT_ACTION: ${{ github.event.action }}
+        LABEL_NAME: ${{ github.event.label.name }}
+        COMMENT_BODY: ${{ github.event.comment.body }}
+      run: |
+        source ${GITHUB_ACTION_PATH}/scripts/trigger-handler.sh
+        check_trigger_condition
+
+    - name: Checkout Repository
+      if: steps.check-trigger.outputs.should_review == 'true'
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ github.event.pull_request.head.sha }}
+
+    - name: Setup Node.js
+      if: steps.check-trigger.outputs.should_review == 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: ${{ github.action_path }}/package-lock.json
+
+    - name: Check PR Size
+      if: steps.check-trigger.outputs.should_review == 'true'
+      id: pr-size
+      shell: bash
+      env:
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        MAX_FILES: ${{ inputs.max-files }}
+        MAX_LINES: ${{ inputs.max-lines }}
+      run: |
+        echo "::group::Checking PR size"
+
+        # Get changed files count
+        FILES=$(git diff --name-only origin/${BASE_REF}...HEAD 2>/dev/null | wc -l | tr -d ' ')
+
+        # Get lines changed
+        LINES=$(git diff --numstat origin/${BASE_REF}...HEAD 2>/dev/null | awk '{sum+=$1+$2} END {print sum}')
+        LINES=${LINES:-0}
+
+        echo "files_changed=$FILES" >> $GITHUB_OUTPUT
+        echo "lines_changed=$LINES" >> $GITHUB_OUTPUT
+
+        echo "Stats: PR Size:"
+        echo "  Files: $FILES (limit: $MAX_FILES)"
+        echo "  Lines: $LINES (limit: $MAX_LINES)"
+
+        if [ $FILES -gt $MAX_FILES ] || [ $LINES -gt $MAX_LINES ]; then
+          echo "skip=true" >> $GITHUB_OUTPUT
+          echo "::warning::PR exceeds size limits. Files: $FILES/$MAX_FILES, Lines: $LINES/$MAX_LINES"
+        else
+          echo "skip=false" >> $GITHUB_OUTPUT
+          echo "[OK] PR size within limits"
+        fi
+
+        echo "::endgroup::"
+
+    - name: Install Dependencies
+      if: steps.check-trigger.outputs.should_review == 'true' && steps.pr-size.outputs.skip == 'false'
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        echo "::group::Installing dependencies"
+        npm ci --production --prefer-offline --no-audit
+        echo "[OK] Dependencies installed"
+        echo "::endgroup::"
+
+    - name: Run Sage Review
+      if: steps.check-trigger.outputs.should_review == 'true' && steps.pr-size.outputs.skip == 'false'
+      id: review
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        LLM_PROVIDER: ${{ inputs.llm-provider }}
+        LLM_API_KEY: ${{ inputs.llm-api-key }}
+        LLM_MODEL: ${{ inputs.llm-model }}
+        GOOGLE_PROJECT_ID: ${{ inputs.google-project-id }}
+        GOOGLE_LOCATION: ${{ inputs.google-location }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        WORKSPACE: ${{ github.workspace }}
+        THINKING_BUDGET: ${{ inputs.thinking-budget }}
+        MAX_TOKENS: ${{ inputs.max-tokens }}
+        GUIDELINES_PATH: ${{ inputs.guidelines-path }}
+        SEVERITY_THRESHOLD: ${{ inputs.severity-threshold }}
+        FAIL_ON_ERRORS: ${{ inputs.fail-on-errors }}
+      run: |
+        echo "::group::Running Sage review"
+        node scripts/review.js
+        EXIT_CODE=$?
+        echo "::endgroup::"
+
+        if [ $EXIT_CODE -ne 0 ]; then
+          if [ "$FAIL_ON_ERRORS" = "true" ]; then
+            echo "::error::Sage review failed"
+            exit $EXIT_CODE
+          else
+            echo "::warning::Sage review encountered errors but continuing (fail-on-errors=false)"
+          fi
+        fi
+
+    - name: Post Size Warning
+      if: steps.check-trigger.outputs.should_review == 'true' && steps.pr-size.outputs.skip == 'true'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        FILES_CHANGED: ${{ steps.pr-size.outputs.files_changed }}
+        LINES_CHANGED: ${{ steps.pr-size.outputs.lines_changed }}
+        MAX_FILES: ${{ inputs.max-files }}
+        MAX_LINES: ${{ inputs.max-lines }}
+      run: |
+        source ${GITHUB_ACTION_PATH}/scripts/post-comments.sh
+        post_size_warning
+
+    - name: Summary
+      if: always() && steps.check-trigger.outputs.should_review == 'true'
+      shell: bash
+      run: |
+        echo "## 🛡️ Sage Review Summary" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ steps.pr-size.outputs.skip }}" = "true" ]; then
+          echo "[WARNING] **Review skipped**: PR too large" >> $GITHUB_STEP_SUMMARY
+          echo "- Files: ${{ steps.pr-size.outputs.files_changed }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Lines: ${{ steps.pr-size.outputs.lines_changed }}" >> $GITHUB_STEP_SUMMARY
+        elif [ "${{ steps.review.outputs.completed }}" = "true" ]; then
+          echo "[SUCCESS] **Review completed successfully**" >> $GITHUB_STEP_SUMMARY
+          echo "- Provider: ${{ inputs.llm-provider }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Findings: ${{ steps.review.outputs.findings_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Critical: ${{ steps.review.outputs.critical_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- High: ${{ steps.review.outputs.high_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Cost: \$$${{ steps.review.outputs.cost_estimate }}" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "[ERROR] **Review failed**" >> $GITHUB_STEP_SUMMARY
+        fi

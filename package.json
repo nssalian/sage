@@ -1,0 +1,49 @@
+{
+  "name": "sage",
+  "version": "1.0.0",
+  "description": "AI-powered code reviews with your choice of LLM provider",
+  "private": false,
+  "main": "scripts/review.js",
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint scripts/**/*.js",
+    "lint:fix": "eslint scripts/**/*.js --fix"
+  },
+  "keywords": [
+    "code-review",
+    "ai",
+    "llm",
+    "github-actions",
+    "anthropic",
+    "openai",
+    "gemini",
+    "claude",
+    "gpt-4",
+    "sage"
+  ],
+  "author": "Sage Contributors",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "@google-cloud/vertexai": "^1.7.0",
+    "@octokit/rest": "^21.0.2",
+    "openai": "^4.67.3"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "jest": "^29.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nssalian/sage"
+  },
+  "bugs": {
+    "url": "https://github.com/nssalian/sage/issues"
+  },
+  "homepage": "https://github.com/nssalian/sage#readme"
+}
